@@ -1,0 +1,183 @@
+import gc
+import random
+import time
+from collections import deque
+
+import numpy as np
+import tensorflow as tf
+from oandapyV20 import API
+from oandapyV20.endpoints import accounts, trades
+from oandapyV20.endpoints.positions import PositionDetails
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+
+account_id = "001-001-2284731-001"
+api_key = '8d59dc32490c0e3caaf3158584aed1f1-375716c27782bc684c8c0ca3badc1e92'
+api_url = "api-fxtrade.oanda.com"
+
+# create API client
+api = API(access_token=api_key, environment="live")
+
+EPISODES = 10000000  # You can adjust this number as needed
+
+
+class DQNAgent:
+    def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=100000)  # increased memory capacity
+        self.gamma = 0.99  # increased discount rate
+        self.epsilon = 1.0  # exploration rate
+        self.epsilon_min = 0.1  # increased minimum exploration rate
+        self.epsilon_decay = 0.999  # slower exploration decay rate
+        self.learning_rate = 0.0001  # decreased learning rate
+        self.model = self._build_model()
+
+    def _build_model(self):
+        model = tf.keras.Sequential()
+        model.add(Dense(128, input_dim=self.state_size, activation='relu'))  # increased neuron count
+        model.add(Dense(128, activation='relu'))  # increased neuron count
+        model.add(Dense(self.action_size, activation='linear'))
+        model.compile(loss='mse', optimizer=Adam(lr=self.learning_rate))
+        return model
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        state = np.reshape(state, (1, self.state_size))  # Reshape the state to have the correct dimensions
+        act_values = self.model.predict(state)
+        return np.argmax(act_values[0])  # returns action
+
+    def replay(self, batch_size):
+        minibatch = random.sample(self.memory, batch_size)
+        states = np.array([t[0] for t in minibatch])
+        actions = np.array([t[1] for t in minibatch])
+        rewards = np.array([t[2] for t in minibatch])
+        next_states = np.array([t[3] for t in minibatch])
+        done = np.array([t[4] for t in minibatch])
+
+        # Batch prediction and updates
+        target = rewards + self.gamma * np.amax(self.model.predict(next_states), axis=1)
+        target[done] = rewards[done]
+        target_f = self.model.predict(states)
+        target_f[range(batch_size), actions] = target
+        self.model.fit(states, target_f, epochs=1, verbose=0)
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def load(self, name):
+        self.model.load_weights(name)
+
+    def save(self, name):
+        self.model.save_weights(name)
+
+
+def close_units(agent, pair, trade_id, state, unrealized_pl):
+    if unrealized_pl <= 0:
+        return False
+
+    action = agent.act(state)
+
+    if action == 1:
+        cashout = random.uniform(3000, 25000.0)
+        cashout = float(cashout)
+        cashout = round(cashout, 0)
+        trade_details = trades.TradeDetails(accountID=account_id, tradeID=trade_id)
+        try:
+            trade_info = api.request(trade_details)
+            current_units = abs(float(trade_info['trade']['currentUnits']))
+            units_to_close = min(cashout, current_units)
+
+            trade_close = trades.TradeClose(accountID=account_id, tradeID=trade_id, data={'units': str(units_to_close)})
+            response = api.request(trade_close)
+            return True
+        except Exception as e:
+            print(f"Error closing units of {pair} (trade ID: {trade_id}): {e}")
+            return False
+    return False
+
+
+def normalize_state(account_balance, margin_used):
+    # Normalize the input state values using appropriate methods.
+    normalized_balance = account_balance / 100000
+    normalized_margin_used = margin_used / 100000
+
+    return np.array([normalized_balance, normalized_margin_used])
+
+
+def reward_function(unrealized_pl):
+    if unrealized_pl > 1:
+        return 1
+    elif unrealized_pl < 0:
+        return -1
+    else:
+        return 0
+
+
+def main():
+    state_size = 2  # account_balance, margin_used
+    action_size = 2  # do nothing, close units
+    agent = DQNAgent(state_size, action_size)
+    batch_size = 128
+
+    # Load the saved model (uncomment the next line if you have a saved model)
+    # agent.load("dqn_trading_bot_model.h5")
+
+    while True:
+        r = accounts.AccountDetails(account_id)
+        wer1 = api.request(r)
+        positions = wer1["account"]["positions"]
+        account_balance = float(wer1["account"]["balance"])
+
+        for i in range(32):
+            if i >= len(positions):
+                break
+
+            pair = positions[i]["instrument"]
+            position_details = PositionDetails(accountID=account_id, instrument=pair)
+
+            try:
+                api.request(position_details)
+                margin_used = float(position_details.response['position']['marginUsed'])
+                unrealized_pl = float(position_details.response['position']['unrealizedPL'])
+                state = normalize_state(account_balance, margin_used)
+
+                print(f"Instrument: {pair} | Margin used: {margin_used} | Unrealized P/L: {unrealized_pl}")
+
+                long_units = float(position_details.response['position']['long']['units'])
+                short_units = float(position_details.response['position']['short']['units'])
+                long_trade_id = position_details.response['position']['long']['tradeIDs'][
+                    0] if long_units != 0 else None
+                short_trade_id = position_details.response['position']['short']['tradeIDs'][
+                    0] if short_units != 0 else None
+
+                if long_trade_id is not None:
+                    done = close_units(agent, pair, long_trade_id, state, unrealized_pl)
+                    reward = reward_function(unrealized_pl)
+                    next_state = normalize_state(account_balance, margin_used)
+                    agent.remember(state, 1, reward, next_state, done)
+
+                if short_trade_id is not None:
+                    done = close_units(agent, pair, short_trade_id, state, unrealized_pl)
+                    reward = reward_function(unrealized_pl)
+                    next_state = normalize_state(account_balance, margin_used)
+                    agent.remember(state, 1, reward, next_state, done)
+
+                if len(agent.memory) > batch_size:
+                    agent.replay(batch_size)
+
+            except (KeyError, TypeError, IndexError):
+                print(f"Error getting position margin for {pair}. Skipping this position.")
+
+        time.sleep(150)  # Adjust the sleep time (in seconds) to set the desired interval between iterations
+        gc.collect()
+        # Save the model after all episodes are completed
+        agent.save("dqn_trading_bot_model.h5")
+
+
+if __name__ == "__main__":
+    main()
