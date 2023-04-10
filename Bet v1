@@ -1,0 +1,264 @@
+import random
+import time
+from oandapyV20.endpoints.positions import OpenPositions
+from oandapyV20.endpoints.orders import OrderCreate
+from oandapyV20.endpoints.trades import TradeClose, TradesList
+import numpy as np
+from oandapyV20 import API
+from oandapyV20.endpoints.accounts import AccountDetails
+from oandapyV20.endpoints.orders import OrderCreate
+from oandapyV20.endpoints.positions import OpenPositions
+
+# Define your Oanda API credentials
+accountID = "001-001-2284731-001"
+access_token = '8d59dc32490c0e3caaf3158584aed1f1-375716c27782bc684c8c0ca3badc1e92'
+headers = {"Authorization": '8d59dc32490c0e3caaf3158584aed1f1-375716c27782bc684c8c0ca3badc1e92'}
+
+account_id = "001-001-2284731-001"
+api_key = '8d59dc32490c0e3caaf3158584aed1f1-375716c27782bc684c8c0ca3badc1e92'
+client = API(access_token=api_key, environment="live")
+api = API(access_token=api_key, environment="live")
+pair = "GBP_USD"
+pnl = 0
+import oandapyV20
+from oandapyV20.exceptions import V20Error
+
+
+def get_account_margin(accountID, api):
+    global response
+    try:
+        # Get account details
+        account_details = AccountDetails(accountID=accountID)
+        try:
+            response = api.request(account_details)
+        except Exception:
+            pass
+        account_info = response.get("account")
+
+        # Return the available margin
+        margin = float(account_info['marginAvailable'])
+        return margin
+
+    except V20Error as e:
+        print(f"Error getting account margin: {e}")
+        return None
+
+
+import oandapyV20.endpoints.instruments as instruments
+
+
+def get_next_price(pair):
+    try:
+        # Get latest candlestick data for the given pair
+        request = instruments.InstrumentsCandles(
+            instrument=pair,
+            params={
+                "granularity": "M1",
+                "count": 1,
+                "price": "M"
+            }
+        )
+        response = None  # Initialize the 'response' variable
+
+        try:
+            response = api.request(request)
+        except Exception as e:
+            print(f"Error requesting price data: {e}")
+
+        # Extract the mid price from the candlestick data
+        if response is not None:
+            candles = response.get("candles")
+            if len(candles) > 0:
+                mid = float(candles[0]['mid']['c'])
+                return mid
+        else:
+            print("Error: Price data response is None.")
+            return None
+
+    except V20Error as e:
+        print(f"Error getting next price: {e}")
+        return None
+
+
+def betsize(balance, consecutive_wins, consecutive_losses, win_bet_sequence, loss_bet_sequence):
+    # Calculate the Fibonacci index for the current number of consecutive wins
+    fib_index = min(consecutive_wins, len(win_bet_sequence) - 1)
+
+    # Calculate the binary index for the current number of consecutive losses
+    bin_index = min(consecutive_losses, len(loss_bet_sequence) - 1)
+
+    # Calculate the bet size based on the balance and the bet sequences
+    bet = balance * (win_bet_sequence[fib_index] + loss_bet_sequence[bin_index]) / 100
+
+    return bet
+
+
+from oandapyV20.endpoints.trades import TradeClose
+
+
+def trade(pair):
+    # Define the margin rate per unit for the given currency pair
+    global position_direction
+    margin_rate = 0.33
+
+    # Define the bet size sequences
+    win_bet_sequence = [1, 2, 4, 8, 16, 32]
+    loss_bet_sequence = [1, 2, 3, 5, 8, 13, 21, 34]
+
+    # Set initial balance
+    balance = get_account_margin(accountID, api)
+
+    # Initialize consecutive wins and losses counters
+    consecutive_wins = 0
+    consecutive_losses = 0
+
+    # Start trading loop
+    while True:
+        # Get the next price for the given pair
+        price = get_next_price(pair)
+        ran = random.uniform(30.0, 90.0)
+        ran = float(ran)
+        print(f"Balance: {balance:.2f}")
+        print(f"Consecutive Wins: {consecutive_wins}")
+        print(f"Consecutive Losses: {consecutive_losses}")
+
+        try:
+            # Select a random position (long or short)
+            if balance < 0:
+                position = 'long' if balance % 2 == 0 else 'short'
+            else:
+                lambda_value = 1
+                poisson_value = np.random.poisson(lambda_value)
+
+                # Use the Poisson value to determine the position
+                position = 'long' if poisson_value % 2 == 0 else 'short'
+
+            # Get the current position direction and PnL
+            open_positions_request = oandapyV20.endpoints.positions.OpenPositions(accountID=account_id)
+            response = api.request(open_positions_request)
+            positions = response.get("positions", [])
+
+            # Set initial pnl value to 0
+            pnl = 0
+            if len(positions) > 0 and (len(positions[0]['long']) > 0 or len(positions[0]['short']) > 0):
+                for position in positions:
+                    position_direction = position['long']['units'] if float(position['long']['units']) > 0 else 'short'
+                    pnl = float(position['pl'])
+
+            # If the current position has a negative PnL, only take a random order on the same size
+            if pnl < 0:
+                if position_direction == 'long':
+                    position = 'long'
+                else:
+                    position = 'short'
+
+            # Sleep for 1 minutes
+            time.sleep(ran)
+
+            # Get the next price again
+            next_price = get_next_price(pair)
+
+            # Determine if the trade is a win or a loss based on price movement
+            if next_price is not None and price is not None:
+                if position == 'long':
+                    win = next_price > price
+                else:
+                    win = next_price < price
+            else:
+                print("Error: Unable to determine win or loss due to missing price data.")
+                continue
+
+            # Update consecutive wins and losses counters
+            if win:
+                consecutive_wins += 1
+                consecutive_losses = 0
+            else:
+                consecutive_wins = 0
+                consecutive_losses += 1
+
+            # Calculate the bet size based on the balance and consecutive wins/losses
+            bet = betsize(balance, consecutive_wins, consecutive_losses, win_bet_sequence, loss_bet_sequence)
+
+            units = bet / margin_rate
+            units = float(units)
+            units = round(units, 0)
+
+            # Add the cap at 1000 units
+            units = min(units, 1000)
+            # Construct the order data
+            order_data = {
+                "order": {
+                    "units": str(units),
+                    "instrument": pair,
+                    "timeInForce": "FOK",
+                    "type": "MARKET",
+                    "positionFill": "DEFAULT",
+                    "clientExtensions": {
+                        "comment": "AI_Trading"
+                    }
+                }
+            }
+
+            # Send buy/sell order to Oanda API with bet amount
+            if position == 'long':
+                order_data["order"]["units"] = str(units)
+                order_data["order"]["instrument"] = pair
+                order_data["order"]["type"] = "MARKET"
+            else:
+                order_data["order"]["units"] = str(-units)
+                order_data["order"]["instrument"] = pair
+                order_data["order"]["type"] = "MARKET"
+
+            # Check if the current position direction matches the signal direction
+            trades_request = oandapyV20.endpoints.trades.TradesList(accountID=account_id)
+            trades = api.request(trades_request)['trades']
+            current_position = 'long' if len(trades) > 0 and int(trades[0]['currentUnits']) > 0 else 'short'
+            pnl = trades[0]['unrealizedPL'] if len(trades) > 0 else 0
+
+            if current_position == position:
+                # Place the order
+                try:
+                    r = OrderCreate(accountID=accountID, data=order_data)
+                    response = api.request(r)
+                    print("Order successfully placed!")
+                except V20Error as e:
+                    print(f"Error placing order: {e}")
+
+                # Update balance based on the outcome of the trade
+                if win:
+                    balance += bet
+                else:
+                    balance -= bet
+
+                # If the balance is negative, reset the position and balance
+                if balance < 0:
+                    position = np.random.choice(['long', 'short'])
+                    balance = get_account_margin(accountID, api)
+
+                # Place the order
+                try:
+                    r = OrderCreate(accountID=accountID, data=order_data)
+                    response = api.request(r)
+                    print("Order response:", response)
+
+                    print("Order successfully placed!")
+                except V20Error as e:
+                    print(f"Error placing order: {e}")
+
+                # Update balance based on the outcome of the trade
+                if win:
+                    balance += bet
+                else:
+                    balance -= bet
+
+                # If the balance is negative, reset the position and balance
+                if balance < 0:
+                    position = np.random.choice(['long', 'short'])
+                    balance = get_account_margin(accountID, api)
+
+        except V20Error as e:
+            print(f"Error getting next price: {e}")
+
+
+while True:
+    trade("GBP_USD", )  # replace "EUR_USD" with the desired currency pair
